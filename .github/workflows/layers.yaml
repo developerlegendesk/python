@@ -1,0 +1,86 @@
+name: Deploy Lambda Layers
+
+on:
+  workflow_dispatch:
+    inputs:
+      S3_BUCKET_NAME:
+        default: mc-2-knock-1-dev-us-west-1-data
+      AWS_REGION:
+        default: us-west-1
+      ENV:
+        default: dev
+
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.11
+
+    - name: Configure AWS credentials - development
+      uses: aws-actions/configure-aws-credentials@v1
+      if: ${{ github.event.inputs.ENV == 'dev' }}
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_DEV_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_DEV_ACCESS_KEY }}
+        # TODO make ENV agnostic or from param
+        aws-region: ${{ github.event.inputs.AWS_REGION }}
+
+    - name: Configure AWS credentials - production
+      uses: aws-actions/configure-aws-credentials@v1
+      if: ${{ github.event.inputs.ENV == 'prod' }}
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_PROD_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_PROD_ACCESS_KEY }}
+        # TODO make ENV agnostic or from param
+        aws-region: ${{ github.event.inputs.AWS_REGION }}
+
+    - name: Install Packages for layers
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y gcc libffi-dev libssl-dev libxml2-dev libxslt-dev python3.10-dev
+
+        mkdir -p layers_packages
+        STATIC_DEPS=true pip3.10 install -r layers_requirements.txt \
+          --target layers_packages \
+          --platform manylinux2014_x86_64 \
+          --implementation cp \
+          --python-version 3.10 \
+          --only-binary=:all: --upgrade
+
+        ls -l layers_packages/
+
+    - name: Package Layers
+      run: |
+        chmod +x .github/scripts/prepare-layer-zip.sh
+        ./.github/scripts/prepare-layer-zip.sh pytz pytz
+        ./.github/scripts/prepare-layer-zip.sh requests bin,certifi,charset_normalizer,idna,requests,urllib3
+        ./.github/scripts/prepare-layer-zip.sh mailchimp_marketing mailchimp_marketing,six.py
+        
+
+
+    - name: Upload layers to S3
+      run: |
+        BUCKET_NAME="mc-2-knock-1-${{ github.event.inputs.ENV }}-${{ github.event.inputs.AWS_REGION }}-data"
+        echo $BUCKET_NAME
+
+        aws s3 cp python_pytz_layer.zip s3://${{ github.event.inputs.S3_BUCKET_NAME }}/layers/mc-2-knock_python_pytz_layer.zip
+        aws s3 cp python_requests_layer.zip s3://${{ github.event.inputs.S3_BUCKET_NAME }}/layers/mc-2-knock_python_requests_layer.zip
+        aws s3 cp python_mailchimp_marketing_layer.zip s3://${{ github.event.inputs.S3_BUCKET_NAME }}/layers/mc-2-knock_python_mailchimp_marketing_layer.zip
+
+
+    - name: Publish layers to Lambda
+      run: |
+        chmod +x .github/scripts/publish-layer.sh
+
+        ./.github/scripts/publish-layer.sh mc-2-knock_python_pytz_layer ${{ github.event.inputs.AWS_REGION }} ${{ github.event.inputs.S3_BUCKET_NAME }}
+        ./.github/scripts/publish-layer.sh mc-2-knock_python_requests_layer ${{ github.event.inputs.AWS_REGION }} ${{ github.event.inputs.S3_BUCKET_NAME }}
+        ./.github/scripts/publish-layer.sh mc-2-knock_python_mailchimp_marketing_layer ${{ github.event.inputs.AWS_REGION }} ${{ github.event.inputs.S3_BUCKET_NAME }}

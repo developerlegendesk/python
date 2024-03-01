@@ -1,0 +1,11 @@
+{
+  "name": "mc-2-knock-1",
+  "version": "1.0.0",
+  "description": "ETL Process that would sync data from MailChimp to Knock DB on scheduled basis",
+  "main": "index.js",
+  "author": "Tomasz Dubiel",
+  "license": "MIT",
+  "dependencies": {
+    "serverless-step-functions": "^3.14.0"
+  }
+}

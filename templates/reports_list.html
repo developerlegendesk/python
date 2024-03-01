@@ -1,0 +1,35 @@
+<html>
+<head>
+  <style id='table-inline-css' type='text/css'>
+/* __table.css__ */
+  </style>
+</head>
+
+<body>
+  <h1>Reports list (__ENV__)</h1>
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th class="max-25-procent">Lists</th>
+        <th class="right">Records</th>
+        <th class="right">Errors</th>
+      </tr>
+    <tbody>
+/* __events_loop__ */
+    </tbody>
+  </table>
+  <pre>
+/* results_dump */
+  </pre>
+  <script>
+    const dates = document.querySelectorAll('a.date')
+    dates.forEach(a => {
+      const utcTimestamp = (a.textContent).trim()
+      const localTime = new Date(utcTimestamp).toLocaleString()
+      a.textContent = localTime.replace(':00 ', ' ')
+    })
+  </script>
+</body>
+
+</html>

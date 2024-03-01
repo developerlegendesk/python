@@ -1,0 +1,654 @@
+service: mc-2-knock-1
+
+provider:
+  name: aws
+  runtime: python3.10
+  region: ${opt:region, 'us-east-1'}
+  logRetentionInDays: 30
+  tags:
+    Project: ${self:service}-${opt:stage, sls:stage, 'dev'}
+
+  apiGateway:
+    shouldStartNameWithService: true
+    minimumCompressionSize: 1024
+  httpApi:
+    payload: '1.0'
+    cors: true
+
+  iam:
+    role:
+      name: ${self:service}-${opt:stage, sls:stage, 'dev'}-${self:provider.region}-lambda-role
+      statements:
+        - 
+          Effect: Allow
+          Action:
+            - s3:ListBucket
+            - s3:PutObject
+            - s3:GetObject
+          Resource: 
+            - Fn::Join:
+                - ''
+                - - 'arn:aws:s3:::'
+                  - Ref: DataAppS3Bucket
+            - Fn::Join:
+                - ''
+                - - 'arn:aws:s3:::'
+                  - Ref: DataAppS3Bucket
+                  - "/*"
+        - 
+          Effect: Allow
+          Action:
+            - dynamodb:Query
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+          Resource: !GetAtt StatusTable.Arn
+        -
+          Effect: Allow
+          Action: 
+            - states:StartExecution
+          Resource:
+            - arn:aws:states:${self:provider.region}:*:stateMachine:${self:service}-orchestrate-sync-process-${opt:stage, sls:stage, 'dev'}
+        # -
+        #   Effect: Allow
+        #   Action:
+        #     - secretsmanager:GetSecretValue
+        #   Resource:
+        #     - !Sub "arn:aws:secretsmanager:${self:provider.region}:*:secret:${self:service}-${opt:stage, sls:stage, 'dev'}/mailchimp-service-*"
+        -
+          Effect: Allow
+          Action:
+            - sqs:GetQueueAttributes
+            - sqs:ReceiveMessage
+            - sqs:SendMessage
+            - sqs:DeleteMessage
+          Resource:
+            - !GetAtt RecordsToSyncToKnackQueue.Arn
+            - !GetAtt RecordsToSyncToKnackQueueDLQ.Arn
+            - !GetAtt RecordsToSyncToMailChimpQueue.Arn
+            - !GetAtt RecordsToSyncToMailChimpQueueDLQ.Arn
+        -
+          Effect: Allow
+          Action:
+            - sns:Publish
+          Resource:
+            - !Sub "arn:aws:sns:${self:provider.region}:*:${self:service}-${opt:stage, sls:stage, 'dev'}-records-to-sync-push-knack"
+            - !Sub "arn:aws:sns:${self:provider.region}:*:${self:service}-${opt:stage, sls:stage, 'dev'}-records-to-sync-push-mc"
+        
+
+
+custom:
+  layersVersions:
+    dev:
+      pytz: '2'
+      mailchimp_marketing: '2'
+      requests: '2'
+    prod:
+      pytz: '1'
+      mailchimp_marketing: '1'
+      requests: '1'
+  
+
+  scheduleEvent:
+    dev: false
+    prod: true
+
+
+
+
+plugins:
+  - serverless-step-functions
+
+
+package:
+  individually: true
+  patterns:
+    - '!**'
+    - 'src/services/**'
+    - 'src/utils.py'
+
+
+
+stepFunctions:
+  stateMachines:
+    OrchestrateSyncProcess:
+      name: ${self:service}-orchestrate-sync-process-${opt:stage, sls:stage, 'dev'}
+      dependsOn: 
+        - OrchestrateSyncProcessRole
+      role: !GetAtt OrchestrateSyncProcessRole.Arn
+      definition:
+        StartAt: StartingPoint
+        States:
+          StartingPoint:
+            Type: Pass
+            Next: RunListIdsLoop
+
+          RunListIdsLoop:
+            Type: Map
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: INLINE
+              StartAt: RunInitialMembersPull
+              States:
+                RunInitialMembersPull:
+                  Type: Task
+                  Resource: !GetAtt MailChimpPuller.Arn
+                  Parameters:
+                    current_timestamp.$: "$.current_timestamp"
+                    list_id.$: "$.list_id"
+                    list_size.$: "$.list_size"
+                    since.$: "$.since"
+                    is_initial: true
+                    offset: 0
+                  Retry:
+                    -
+                      ErrorEquals:
+                        - Lambda.SdkClientException
+                        - Lambda.TooManyRequestsException
+                        - Lambda.ServiceException
+                        - Lambda.AWSLambdaException
+                        - States.Timeout
+                        - States.TaskFailed
+                      IntervalSeconds: 5
+                      BackoffRate: 2
+                      MaxAttempts: 3
+                  ResultPath: "$.PullingList"
+                  Next: RunInitialMembersPullLoop
+
+                RunInitialMembersPullLoop:
+                  Type: Map
+                  ItemProcessor:
+                    ProcessorConfig:
+                      Mode: INLINE
+                    StartAt: RunNextMembersPull
+                    States:
+                      RunNextMembersPull:
+                        Type: Task
+                        Resource: !GetAtt MailChimpPuller.Arn
+                        Parameters:
+                          current_timestamp.$: "$.current_timestamp"
+                          list_id.$: "$.list_id"
+                          is_initial: false
+                          offset.$: "$.offset"
+                          list_size.$: "$.list_size"
+                          since.$: "$.since"
+                        Retry:
+                          - ErrorEquals:
+                              - Lambda.ServiceException
+                              - Lambda.AWSLambdaException
+                              - Lambda.SdkClientException
+                              - Lambda.TooManyRequestsException
+                            IntervalSeconds: 2
+                            MaxAttempts: 3
+                            BackoffRate: 2
+                        Next: RunKnackUpdaterTrigger
+
+                      RunKnackUpdaterTrigger:
+                        Type: Task
+                        Resource: !GetAtt KnackUpdater.Arn
+                        Parameters:
+                          current_timestamp.$: "$.current_timestamp"
+                          records_to_process.$: "$.records_to_process"
+                          trigger: true
+                        End: true
+
+                  MaxConcurrency: 4
+                  ItemsPath: "$.PullingList"
+                  ResultPath: "$.MailChimpPullingResults"
+                  Next: RunRecordPullingResults
+
+
+                RunRecordPullingResults:
+                  Type: Task
+                  Resource: !GetAtt RecordPullingResults.Arn
+                  Parameters:
+                    current_timestamp.$: "$.current_timestamp"
+                    list_id.$: "$.list_id"
+                    pull_results.$: "$.MailChimpPullingResults"
+                  ResultPath: "$.RecordPullingResults"
+                  Next: RunKnackUpdater
+
+
+                RunKnackUpdater:
+                  Type: Task
+                  Resource: !GetAtt KnackUpdater.Arn
+                  Parameters:
+                    current_timestamp.$: "$.current_timestamp"
+                  Next: RunMailChimpUpdater
+
+                RunMailChimpUpdater:
+                  Type: Task
+                  Resource: !GetAtt MailChimpUpdater.Arn
+                  End: true
+
+            MaxConcurrency: 2
+            ItemsPath: "$.lists"
+            ResultPath: "$.RunMailChimpPullerLoopResults"
+            Next: RunMailChimpUpdaterFront
+
+
+          RunMailChimpUpdaterFront:
+            Type: Task
+            Resource: !GetAtt MailChimpUpdater.Arn
+            ResultPath: "$.RunMailChimpUpdaterLoopResults"
+            Retry:
+              -
+                ErrorEquals:
+                  - States.Timeout
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                BackoffRate: 2
+                MaxAttempts: 3
+            Next: RunKnackUpdaterLoop
+
+          RunKnackUpdaterLoop:
+            Type: Task
+            Resource: !GetAtt KnackUpdater.Arn
+            ResultPath: "$.RunKnackUpdaterLoopResults"
+            Retry:
+              -
+                ErrorEquals:
+                  - States.Timeout
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                BackoffRate: 2
+                MaxAttempts: 3
+            Next: CheckForKnackQueueToBeEmpty
+
+          CheckForKnackQueueToBeEmpty:
+            Type: Choice
+            Choices:
+              # - Variable: $.RunKnackUpdaterLoopResults.remaining
+              #   BooleanEquals: false
+              #   Next: WorkerQueueErrorNotification
+              - Variable: $.RunKnackUpdaterLoopResults.remaining
+                NumericEquals: 0
+                Next: RunMailChimpUpdaterLoop
+              - Variable: $.RunKnackUpdaterLoopResults.waiting
+                BooleanEquals: true
+                Next: WaitForInFlightMessagesKnack
+            Default: RunMailChimpUpdaterFront
+
+          WaitForInFlightMessagesKnack:
+            Type: Wait
+            Seconds: 30
+            Next: RunMailChimpUpdaterFront
+
+
+          RunMailChimpUpdaterLoop:
+            Type: Task
+            Resource: !GetAtt MailChimpUpdater.Arn
+            ResultPath: "$.RunMailChimpUpdaterLoopResults"
+            Retry:
+              -
+                ErrorEquals:
+                  - States.Timeout
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                BackoffRate: 2
+                MaxAttempts: 3
+            Next: CheckForMailChimpQueueToBeEmpty
+
+          CheckForMailChimpQueueToBeEmpty:
+            Type: Choice
+            Choices:
+              # - Variable: $.RunKnackUpdaterLoopResults.remaining
+              #   BooleanEquals: false
+              #   Next: WorkerQueueErrorNotification
+              - Variable: $.RunMailChimpUpdaterLoopResults.remaining
+                NumericEquals: 0
+                Next: RunKnackUpdateFailuresLoop
+              - Variable: $.RunMailChimpUpdaterLoopResults.waiting
+                BooleanEquals: true
+                Next: WaitForInFlightMessagesMailChimp
+            Default: RunMailChimpUpdaterLoop
+
+          WaitForInFlightMessagesMailChimp:
+            Type: Wait
+            Seconds: 30
+            Next: RunMailChimpUpdaterLoop
+
+
+
+          WaitForInUpdateFailuresLoop:
+            Type: Wait
+            Seconds: 15
+            Next: RunKnackUpdateFailuresLoop
+
+          RunKnackUpdateFailuresLoop:
+            Type: Task
+            Resource: !GetAtt KnackUpdater.Arn
+            ResultPath: "$.RunKnackUpdateFailuresLoopResults"
+            Parameters:
+              current_timestamp.$: "$.current_timestamp"
+              save_errors: true
+            Next: CheckForDlqQueueToBeEmpty
+
+          CheckForDlqQueueToBeEmpty:
+            Type: Choice
+            Choices:
+              - Variable: $.RunKnackUpdateFailuresLoopResults.remaining
+                BooleanEquals: false
+                Next: RunRecordSummaryResults
+              - Variable: $.RunKnackUpdateFailuresLoopResults.remaining
+                NumericEquals: 0
+                Next: RunRecordSummaryResults
+              - Variable: $.RunKnackUpdateFailuresLoopResults.waiting
+                BooleanEquals: true
+                Next: WaitForInUpdateFailuresLoop
+            Default: RunKnackUpdateFailuresLoop
+
+
+
+          RunRecordSummaryResults:
+            Type: Task
+            Resource: !GetAtt RecordSummaryResults.Arn
+            Parameters:
+              current_timestamp.$: "$.current_timestamp"
+            ResultPath: "$.RecordSummaryResults"
+            Next: ClosingPoint
+
+          ClosingPoint:
+            Type: Pass
+            End: true
+
+
+
+
+
+functions:
+
+  ProcessEntryPoint:
+    handler: src/process-entry-point.handler
+    name: ${self:service}-${opt:stage, sls:stage, 'dev'}-process-entry-point
+    timeout: 30
+    environment:
+      ORCHESTRATION_STATE_MACHINE_ARN: !Sub arn:aws:states:${self:provider.region}:${AWS::AccountId}:stateMachine:${self:service}-orchestrate-sync-process-${opt:stage, sls:stage, 'dev'}
+      STATUS_TABLE_NAME: !Select [1, !Split ['/', !GetAtt StatusTable.Arn]]
+      REGION_NAME: ${self:provider.region}
+    package:
+      individually: true
+      patterns:
+        - 'src/process-entry-point.py'
+    events:
+      - eventBridge:
+          schedule: rate(8 hours)
+          enabled: ${self:custom.scheduleEvent.${opt:stage, sls:stage, 'dev'}}
+          input:
+            list_ids:
+              - afd9a8e4ef
+              - fdc72b3ec4
+              - 31a1719578
+              - 342e16db33
+              - 8725f4d734
+            since: 2
+        
+
+  MailChimpPuller:
+    handler: src/mail-chimp-puller.handler
+    name: ${self:service}-${opt:stage, sls:stage, 'dev'}-mail-chimp-puller
+    timeout: 90
+    environment:
+      RECORDS_TO_SYNC_TO_KNACK_QUEUE_URL: !Ref RecordsToSyncToKnackQueue
+      MAILCHIMP_API_KEY: ${env:MAILCHIMP_API_KEY}
+      MAILCHIMP_SERVER: 'us13'
+      REGION_NAME: ${self:provider.region}
+    package:
+      individually: true
+      patterns:
+        - 'src/mail-chimp-puller.py'
+    layers:
+      - !Sub arn:aws:lambda:${self:provider.region}:${AWS::AccountId}:layer:mc-2-knock_python_requests_layer:${self:custom.layersVersions.${opt:stage, sls:stage, 'dev'}.requests}
+      - !Sub arn:aws:lambda:${self:provider.region}:${AWS::AccountId}:layer:mc-2-knock_python_mailchimp_marketing_layer:${self:custom.layersVersions.${opt:stage, sls:stage, 'dev'}.mailchimp_marketing}
+
+
+  KnackUpdater:
+    handler: src/knack-updater.handler
+    name: ${self:service}-${opt:stage, sls:stage, 'dev'}-knack-updater
+    timeout: 90
+    environment:
+      RECORDS_TO_SYNC_TO_KNACK_QUEUE_URL: !Ref RecordsToSyncToKnackQueue
+      RECORDS_TO_SYNC_TO_MAIL_CHIMP_QUEUE_URL: !Ref RecordsToSyncToMailChimpQueue
+      RECORDS_TO_SYNC_TO_KNACK_QUEUE_URL_DLQ: !Ref RecordsToSyncToKnackQueueDLQ
+      KNACK_API_KEY: ${env:KNACK_API_KEY}
+      KNACK_APP_ID: ${env:KNACK_APP_ID}
+      PUSH_AGAIN_TOPIC_ARN: !Ref RecordsToSyncPushTopicKnack
+      STATUS_TABLE_NAME: !Select [1, !Split ['/', !GetAtt StatusTable.Arn]]
+      REGION_NAME: ${self:provider.region}
+    package:
+      individually: true
+      patterns:
+        - 'src/knack-updater.py'
+    events:
+      - sns:
+          topicName: ${self:service}-${opt:stage, sls:stage, 'dev'}-records-to-sync-push-knack
+          arn: !Ref RecordsToSyncPushTopicKnack
+    layers:
+      - !Sub arn:aws:lambda:${self:provider.region}:${AWS::AccountId}:layer:mc-2-knock_python_requests_layer:${self:custom.layersVersions.${opt:stage, sls:stage, 'dev'}.requests}
+
+
+  MailChimpUpdater:
+    handler: src/mail-chimp-updater.handler
+    name: ${self:service}-${opt:stage, sls:stage, 'dev'}-mail-chimp-updater
+    timeout: 60
+    environment:
+      RECORDS_TO_SYNC_TO_MAIL_CHIMP_QUEUE_URL: !Ref RecordsToSyncToMailChimpQueue
+      MAILCHIMP_API_KEY: ${env:MAILCHIMP_API_KEY}
+      MAILCHIMP_SERVER: 'us13'
+      PUSH_AGAIN_TOPIC_ARN: !Ref RecordsToSyncPushTopicMailChimp
+      STATUS_TABLE_NAME: !Select [1, !Split ['/', !GetAtt StatusTable.Arn]]
+      REGION_NAME: ${self:provider.region}
+    package:
+      individually: true
+      patterns:
+        - 'src/mail-chimp-updater.py'
+    events:
+      - sns:
+          topicName: ${self:service}-${opt:stage, sls:stage, 'dev'}-records-to-sync-push-mc
+          arn: !Ref RecordsToSyncPushTopicMailChimp
+    layers:
+      - !Sub arn:aws:lambda:${self:provider.region}:${AWS::AccountId}:layer:mc-2-knock_python_requests_layer:${self:custom.layersVersions.${opt:stage, sls:stage, 'dev'}.requests}
+      - !Sub arn:aws:lambda:${self:provider.region}:${AWS::AccountId}:layer:mc-2-knock_python_mailchimp_marketing_layer:${self:custom.layersVersions.${opt:stage, sls:stage, 'dev'}.mailchimp_marketing}
+
+
+  RecordPullingResults:
+    handler: src/record-pulling-results.handler
+    name: ${self:service}-${opt:stage, sls:stage, 'dev'}-record-pulling-results
+    timeout: 12
+    environment:
+      STATUS_TABLE_NAME: !Select [1, !Split ['/', !GetAtt StatusTable.Arn]]
+      REGION_NAME: ${self:provider.region}
+    package:
+      individually: true
+      patterns:
+        - 'src/record-pulling-results.py'
+
+
+  RecordSummaryResults:
+    handler: src/record-summary-results.handler
+    name: ${self:service}-${opt:stage, sls:stage, 'dev'}-record-summary-results
+    timeout: 12
+    environment:
+      STATUS_TABLE_NAME: !Select [1, !Split ['/', !GetAtt StatusTable.Arn]]
+      REGION_NAME: ${self:provider.region}
+    package:
+      individually: true
+      patterns:
+        - 'src/record-summary-results.py'
+
+
+  ViewReportsDataList:
+    handler: src/view-reports-list.handler
+    name: ${self:service}-${opt:stage, sls:stage, 'dev'}-view-reports-list
+    timeout: 25
+    environment:
+      STATUS_TABLE_NAME: !Select [1, !Split ['/', !GetAtt StatusTable.Arn]]
+      ENV: ${opt:stage, sls:stage, 'dev'}
+      REGION_NAME: ${self:provider.region}
+    package:
+      individually: true
+      patterns:
+        - 'src/view-reports-list.py'
+        - 'templates/*'
+    events:
+      -
+        httpApi:
+          path: /reports
+          method: GET
+
+
+  ViewReportDetail:
+    handler: src/view-report-details.handler
+    name: ${self:service}-${opt:stage, sls:stage, 'dev'}-view-report-details
+    timeout: 25
+    environment:
+      STATUS_TABLE_NAME: !Select [1, !Split ['/', !GetAtt StatusTable.Arn]]
+      ENV: ${opt:stage, sls:stage, 'dev'}
+      REGION_NAME: ${self:provider.region}
+    package:
+      individually: true
+      patterns:
+        - 'src/view-report-details.py'
+        - 'templates/*'
+    events:
+      -
+        httpApi:
+          path: /reports/{timestamp_id}
+          method: GET
+
+
+resources:
+  Resources:
+
+    DataAppS3Bucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:service}-${opt:stage, sls:stage, 'dev'}-${self:provider.region}-data
+        Tags:
+          -
+            Key: Project
+            Value: ${self:service}-${opt:stage, sls:stage, 'dev'}
+
+
+    StatusTable:
+      Type: AWS::DynamoDB::Table
+      # DeletionPolicy: Retain
+      Properties:
+        TableName: ${self:service}-${opt:stage, sls:stage, 'dev'}-status
+        BillingMode: PAY_PER_REQUEST
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+        AttributeDefinitions:
+          -
+            AttributeName: PK
+            AttributeType: S
+          -
+            AttributeName: SK
+            AttributeType: S
+        KeySchema:
+          -
+            AttributeName: PK
+            KeyType: HASH
+          -
+            AttributeName: SK
+            KeyType: RANGE
+        Tags:
+          -
+            Key: Project
+            Value: ${self:service}-${opt:stage, sls:stage, 'dev'}
+
+
+    OrchestrateSyncProcessRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:service}-orchestrate-sync-process-${opt:stage, sls:stage, 'dev'}-${self:provider.region}
+        Path: '/'
+        AssumeRolePolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - states.amazonaws.com
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Policies:
+          -
+            PolicyName: ${self:service}-orchestrate-sync-process-${opt:stage, sls:stage, 'dev'}-${self:provider.region}-policy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - 
+                  Effect: Allow
+                  Action:
+                    - lambda:InvokeFunction
+                  Resource:
+                    - !Sub "arn:aws:lambda:${self:provider.region}:${AWS::AccountId}:function:${self:service}-${opt:stage, sls:stage, 'dev'}-mail-chimp-puller"
+                    - !Sub "arn:aws:lambda:${self:provider.region}:${AWS::AccountId}:function:${self:service}-${opt:stage, sls:stage, 'dev'}-knack-updater"
+                    - !Sub "arn:aws:lambda:${self:provider.region}:${AWS::AccountId}:function:${self:service}-${opt:stage, sls:stage, 'dev'}-mail-chimp-updater"
+                    - !Sub "arn:aws:lambda:${self:provider.region}:${AWS::AccountId}:function:${self:service}-${opt:stage, sls:stage, 'dev'}-record-pulling-results"
+                    - !Sub "arn:aws:lambda:${self:provider.region}:${AWS::AccountId}:function:${self:service}-${opt:stage, sls:stage, 'dev'}-record-summary-results"
+
+
+    RecordsToSyncToKnackQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${opt:stage, sls:stage, 'dev'}-records-to-sync-to-knack
+        VisibilityTimeout: 45
+        MessageRetentionPeriod: 1209600
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt RecordsToSyncToKnackQueueDLQ.Arn
+          maxReceiveCount: 4
+        Tags:
+          -
+            Key: Project
+            Value: ${self:service}-${opt:stage, sls:stage, 'dev'}
+    
+    RecordsToSyncToKnackQueueDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${opt:stage, sls:stage, 'dev'}-records-to-sync-to-knack-dlq
+        MessageRetentionPeriod: 1209600 # 14 days in seconds
+        VisibilityTimeout: 300
+        Tags:
+          -
+            Key: Project
+            Value: ${self:service}-${opt:stage, sls:stage, 'dev'}
+
+
+    RecordsToSyncToMailChimpQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${opt:stage, sls:stage, 'dev'}-records-to-sync-to-mail-chimp
+        VisibilityTimeout: 25
+        MessageRetentionPeriod: 1209600
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt RecordsToSyncToMailChimpQueueDLQ.Arn
+          maxReceiveCount: 3
+        Tags:
+          -
+            Key: Project
+            Value: ${self:service}-${opt:stage, sls:stage, 'dev'}
+    
+    RecordsToSyncToMailChimpQueueDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${opt:stage, sls:stage, 'dev'}-records-to-sync-to-mail-chimp-dlq
+        MessageRetentionPeriod: 1209600 # 14 days in seconds
+        VisibilityTimeout: 300
+        Tags:
+          -
+            Key: Project
+            Value: ${self:service}-${opt:stage, sls:stage, 'dev'}
+
+
+    RecordsToSyncPushTopicKnack:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-${opt:stage, sls:stage, 'dev'}-records-to-sync-push-knack
+
+
+    RecordsToSyncPushTopicMailChimp:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-${opt:stage, sls:stage, 'dev'}-records-to-sync-push-mc

@@ -1,0 +1,58 @@
+<html>
+<head>
+  
+  <style id='table-inline-css' type='text/css'>
+/* __table.css__ */
+  </style>
+</head>
+
+<body>
+  <h1>Report from <span class="date" style="float: right;">__report_timestamp__</span></h1>
+  <table>
+    <thead>
+      <tr>
+        <th colspan="2">List</th>
+        <th class="right">Records</th>
+        <th class="right">Errors</th>
+      </tr>
+    <tbody>
+/* __events_loop__ */
+      <tr>
+        <td colspan="4">
+          <hr/>
+        </td>
+      </tr>
+      <tr class="bold">
+        <td colspan="3">Errors:</td>
+        <td class="right">__errors_count__</td>
+      </tr>
+      <tr class="__hide_errors__">
+        <th colspan="2">
+          Rules
+        </th>
+        <th colspan="2">
+          Values
+        </th>
+      </tr>
+/* __errors_loop__ */
+    </tbody>
+  </table>
+  <pre>
+/* results_dump */    
+  </pre>
+  <script>
+    const dates = document.querySelectorAll('.date')
+    dates.forEach(el => {
+      const utcTimestamp = (el.textContent).trim()
+      const localTime = new Date(utcTimestamp).toLocaleString()
+      el.textContent = localTime.replace(':00 ', ' ')
+    })
+    toggle = (list_id) => {
+      document.querySelectorAll('#list_' + list_id).forEach((item) => {
+        item.classList.toggle('hidden')
+      })
+    }
+  </script>
+</body>
+
+</html>
